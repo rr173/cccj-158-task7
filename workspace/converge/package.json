@@ -11,6 +11,8 @@
     "start": "node src/server.mjs",
     "verify": "node scripts/verify.mjs",
     "verify:archive": "node scripts/verify-archive.mjs",
-    "verify:subscriptions": "node scripts/verify-subscriptions.mjs"
+    "verify:subscriptions": "node scripts/verify-subscriptions.mjs",
+    "verify:diagnose": "node scripts/verify-diagnose.mjs",
+    "verify:all": "node scripts/verify.mjs && node scripts/verify-archive.mjs && node scripts/verify-subscriptions.mjs && node scripts/verify-diagnose.mjs"
   }
 }

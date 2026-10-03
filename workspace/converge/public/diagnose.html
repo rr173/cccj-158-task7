@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>因果差异诊断器 · converge</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --panel2: #1d2638; --line: #2b3650;
+    --text: #e6ebf5; --muted: #8b97b0; --accent: #5b8cff; --ok: #3fb96b;
+    --warn: #e0a13c; --err: #e5484d; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  a { color: var(--accent); }
+  select, input, textarea, button { font: inherit; }
+  select, input[type=text], input[type=password], textarea {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px;
+  }
+  textarea { width: 100%; font-family: var(--mono); font-size: 12px; resize: vertical; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  main { padding: 18px 20px; display: grid; grid-template-columns: 400px 1fr; gap: 16px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; border: 1px solid var(--line); }
+  .tag.sealed { color: var(--ok); border-color: var(--ok); }
+  .tag.queued { color: var(--muted); }
+  .tag.running, .tag.skeletons_built, .tag.diffed, .tag.evidence_written { color: var(--warn); border-color: var(--warn); }
+  .tag.canceled { color: var(--err); border-color: var(--err); }
+  .clickable { cursor: pointer; }
+  .clickable:hover { background: var(--panel2); }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--err); } .warn { color: var(--warn); }
+  pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 12px; overflow:auto; max-height: 420px; }
+  .toast { position: fixed; right: 18px; bottom: 18px; max-width: 520px; }
+  .toast div { background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: 12px; }
+  .toast .errbox { border-left-color: var(--err); }
+  .toast .okbox { border-left-color: var(--ok); }
+  .tree { font-family: var(--mono); font-size: 12px; }
+  .tree .node { padding: 3px 6px; border-radius: 6px; }
+  .tree .node.div { background: rgba(229,72,77,.14); }
+  .tree .node.down { background: rgba(224,161,60,.10); }
+  .pill-role { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 1px 9px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>因果差异诊断器</h1>
+  <span class="pill-role" id="rolepill">未认证</span>
+  <span class="spacer"></span>
+  <label style="margin:0; display:flex; align-items:center; gap:6px;">
+    身份
+    <select id="tokenSelect">
+      <option value="">— 选择身份 —</option>
+      <option value="operator-token">operator（运维：水位/版本/取消）</option>
+      <option value="admin-token">admin（同 operator）</option>
+      <option value="analyst-token">analyst（分析者：选组比对）</option>
+      <option value="observer-token">observer（只读观察者：验证证明）</option>
+    </select>
+  </label>
+  <input type="password" id="tokenInput" placeholder="或粘贴令牌" style="width:190px" />
+  <button class="ghost" id="logoutBtn">退出</button>
+  <button class="ghost" id="refreshBtn">刷新</button>
+  <a href="/" class="muted" style="font-size:12px">返回汇合控制台</a>
+</header>
+
+<main>
+  <div>
+    <!-- Operator: intake -->
+    <section class="panel" id="ingestPanel" hidden>
+      <h2>收据入库（脱敏决定收据组）</h2>
+      <label>收据组 group</label>
+      <input type="text" id="inGroup" placeholder="grp-…" style="width:100%" />
+      <label>整批 entries（JSON；破损/环路/重复序号/同节点异正文整批拒绝）</label>
+      <textarea id="inEntries" rows="8" placeholder='[{"seq":1,"decision_node":"…",...}]'></textarea>
+      <div style="margin-top:8px"><button id="ingestBtn">提交整批</button></div>
+      <pre id="ingestResult" hidden></pre>
+    </section>
+
+    <!-- Operator: versions + cancel + pump -->
+    <section class="panel" id="opsPanel" hidden>
+      <h2>运维</h2>
+      <div id="versionInfo" class="muted">加载中…</div>
+      <label>切换比较算法版本（仅影响之后的新任务）</label>
+      <div class="row">
+        <select id="algoSelect"><option value="chain-v1">chain-v1（序号链对位）</option><option value="topo-v2">topo-v2（拓扑层序 + LCS 对齐）</option></select>
+        <button id="algoBtn" type="button">激活</button>
+      </div>
+      <label>驱动一轮异步计算（确定性）</label>
+      <div><button class="ghost" id="pumpBtn" type="button">推进队列</button></div>
+    </section>
+
+    <!-- Analyst: submit -->
+    <section class="panel" id="comparePanel" hidden>
+      <h2>发起比较</h2>
+      <label>左组 left_group</label><input type="text" id="cmpLeft" style="width:100%" />
+      <label>右组 right_group</label><input type="text" id="cmpRight" style="width:100%" />
+      <label>任务键 task_key（同键同输入复用；同键异输入冲突）</label>
+      <input type="text" id="cmpKey" style="width:100%" placeholder="diag-…" />
+      <div style="margin-top:8px"><button id="compareBtn">提交比较任务</button></div>
+      <pre id="compareResult" hidden></pre>
+    </section>
+
+    <!-- Operator: cancel selected -->
+    <section class="panel" id="cancelPanel" hidden>
+      <h2>取消未开始任务</h2>
+      <div class="muted" style="margin-bottom:6px">仅 queued 可取消；进行中与已密封返回 409，已有诊断不会被覆盖。</div>
+      <div class="row">
+        <input type="text" id="cancelKey" placeholder="task_key" />
+        <button id="cancelBtn" type="button">取消任务</button>
+      </div>
+    </section>
+
+    <!-- Observer: verify -->
+    <section class="panel" id="verifyPanel" hidden>
+      <h2>只读验证证明</h2>
+      <label>粘贴 converge-diagnosis-proof/v1 证明 JSON</label>
+      <textarea id="verifyInput" rows="10"></textarea>
+      <div style="margin-top:8px"><button id="verifyBtn">验证</button></div>
+      <pre id="verifyResult" hidden></pre>
+    </section>
+  </div>
+
+  <div>
+    <!-- Shared: groups + watermarks (operator/analyst) -->
+    <section class="panel" id="groupsPanel" hidden>
+      <h2>收据组与读取水位</h2>
+      <div id="groupsList" class="muted">加载中…</div>
+    </section>
+
+    <!-- Task list + diff tree -->
+    <section class="panel" id="tasksPanel" hidden>
+      <h2>比较任务与差异树</h2>
+      <table id="tasksTable">
+        <thead><tr><th>任务键</th><th>组</th><th>阶段</th><th>算法</th><th>水位 L/R</th><th>结论</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="taskDetail" style="margin-top:12px;"></div>
+    </section>
+
+    <!-- Proof digest view (all tiers; observer sees proof content via paste) -->
+    <section class="panel" id="proofPanel" hidden>
+      <h2>密封证明摘要</h2>
+      <div id="proofBody" class="muted">选择一个已密封任务查看（或使用左侧粘贴验证）。</div>
+    </section>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/diagnose.js"></script>
+</body>
+</html>

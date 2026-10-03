@@ -21,6 +21,7 @@
 
 ```bash
 npm run verify:archive   # 96 项：正常压缩/晚到祖先/并发隔离/重复任务/崩溃恢复/保留策略/篡改/越权
+npm run verify:diagnose  # 100 项：因果差异诊断（见下“面向 converge 的因果差异诊断器”）
 ```
 
 零运行时依赖，仅需 Node.js ≥ 18。
@@ -142,6 +143,66 @@ npm run verify:subscriptions  # 事件订阅 97 项（见下“可靠事件订�
 ```bash
 npm run verify:subscriptions   # 97 项：成功回调/超时恢复/确认丢失重复/密钥边界/
                                #   暂停积压/死信再发/进程恢复/启动补缝/角色/故障隔离/案件与冷段事件
+```
+
+## 面向 converge 的因果差异诊断器
+
+接收两组**已经脱敏的决定收据**，按前驱关系编成可比较的**因果骨架**，异步输出**第一处分歧**、**受影响的下游节点**以及**不含站点、请求键和图像内容**的解释证据。独立追加日志 `diagnose.wal`（magic `CD`），不改动汇合主链路。
+
+### 收据包与入口校验（整包拒绝，绝不生成残缺诊断）
+
+提交即对**整批**收据做三层检查，任一不过返回 `400 DIAG_BAD_BUNDLE`（`details.reasons` 为稳定原因码，**错误响应从不回显任何收据内容**），无任何帧落盘：
+
+| 层 | 拒绝码 |
+| --- | --- |
+| 链签名 | `RECEIPT_HASH_MISMATCH`（正文 hash）/ `RECEIPT_SIG_INVALID`（HMAC）/ `CHAIN_BROKEN`（`prev_receipt` 断链）/ `DUPLICATE_RECEIPT` |
+| 摘要格式 | `DIGEST_FORMAT`（非 64hex）/ `SEQ_MALFORMED` / `SEQ_NOT_CONTIGUOUS` / `DUPLICATE_SEQ` / `REGION_MALFORMED` / `DUPLICATE_PARENT` / `DUPLICATE_REGION` / `BODY_MALFORMED` / `DECISION_KIND_UNKNOWN` / `RECEIPT_MALFORMED`（字段白名单：仅 `seq/decision_node/decision_kind/parents/contributions/prev_receipt/hash/sig`） |
+| 拓扑 | `UNRESOLVED_PREDECESSOR`（悬挂前驱）/ `TOPOLOGY_CYCLE`（Kahn 环检测）/ `NODE_DIGEST_MISMATCH`（同一决定节点两份不同正文） |
+
+签名覆盖 `{seq, group, decision_node, decision_kind, parents, contributions, prev_receipt}`（带 `group` 防跨组重放）；节点身份 `decision_node = sha256(canonical({decision_kind,parents,contributions}))`，同节点异正文不可伪造。续批同样整批校验，已确立水位不会因坏批移动。
+
+### 固定水位、钉版算法、异步阶段
+
+- **读取水位**：创建任务时在单个互斥区内冻结两组当前水位（各自最大序号）与输入指纹（按收据 hash 序列）。冻结之后到达的新收据**绝不混入**该任务（`GET` 详情只切到水位处的骨架与收据）；再次提交同键且任一输入变化 → `409 TASK_INPUT_CONFLICT`，同键同输入返回原任务（`200`，原分歧位置与逐字节相同的证明）。8 路并发提交同一比较恰好一个 `201`，其余全部复用。
+- **算法版本**：`chain-v1`（按收据链序号对位）与 `topo-v2`（最长路径拓扑层序 + LCS 对齐，可识别“同图异序”）。版本在任务创建时**钉住**：切换只影响之后的新任务，进行中/已密封任务保留旧版；激活记录持久化，重启不丢。
+- **持久阶段**：`queued → skeletons_built → diffed → evidence_written → sealed`。每个阶段把产品帧（骨架后仅标记；差异结果、解释证据、证明）与阶段标记在**同一次 write+fsync 批次**落盘。崩溃在批次中途 → 尾帧截断，重启**从上个持久阶段续办，或回到未开始**；解释证据帧每任务恰好一次。崩溃点由 `CONVERGE_DIAGNOSE_CRASH_POINT=before_start|after_diff|after_evidence` 注入。
+- **取消**：仅 `queued` 可由 operator/admin 取消（释放资源）；并发取消恰好一方成功，另一方 `409 TASK_ALREADY_CANCELED`；进行中/已密封返回 `409 TASK_NOT_CANCELLABLE`，已有诊断**不可被静默覆盖**。
+- 任务由后台泵（`CONVERGE_DIAGNOSE_PUMP_MS`，默认 250ms；测试设 0 并由 `/api/diagnose/pump` 显式驱动）按队列处理，重启自动续跑。
+
+### 三档可见范围（刷新即重新读取）
+
+控制台 `/diagnose`（纯静态，`Cache-Control: no-store`，令牌仅存当前标签页 `sessionStorage`）：
+
+| 角色（令牌） | 可见与可做 |
+| --- | --- |
+| operator / admin（`operator-token` / `admin-token`） | 收据入库、查看组水位、**切换算法版本**、驱动泵、**取消未开始任务**、全部只读视图 |
+| analyst（`analyst-token`） | 选择两组对象**发起比较**、查看任务阶段/水位/差异树（双骨架 + 第一处分歧 + 下游闭包）与脱敏证据、读证明 |
+| observer（`observer-token`） | **只能**读取密封证明与验证粘贴的外部证明；看不到组表、任务、骨架、水位之外的任何信息 |
+
+页面不缓存任何业务状态：刷新、轮询都重新请求任务阶段、比较水位与证明摘要；退出立即清空全部 DOM（含验证粘贴框）。
+
+### 证明与验真（`converge-diagnosis-proof/v1`）
+
+证明根含任务键、组、钉版算法、水位、输入指纹、比较结论（分歧/下游）、**脱敏解释证据**、证据列表摘要与密封时间，附 `digest = sha256(canonical(root))` 与服务端 HMAC。分层验真：证据节点摘要 → 分歧/下游引用闭合 → 根摘要 → HMAC；任何一层被改返回确定错误码（`DIAG_PROOF_MALFORMED/FORMAT_UNKNOWN/EVIDENCE_MISMATCH/ROOT_MISMATCH/DIGEST_MISMATCH/SIG_INVALID`）。证据只有决定类别、父边与 `{region, change_digest}` 假名化区段——结构上不可能携带站点、请求键或像素。
+
+| 方法与路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/diagnose/receipts` | operator/admin | 整批入脱敏决定收据；坏包 400 整批拒绝 |
+| `GET /api/diagnose/groups` | operator/admin、analyst | 组与当前读取水位、链头收据 |
+| `POST /api/diagnose/comparisons` | analyst | `{task_key,left_group,right_group}`；201 新建 / 200 同键复用 / 409 同键异输入 |
+| `GET /api/diagnose/comparisons` · `/comparisons/:key` | operator/admin、analyst | 阶段/水位；详情含水印内双骨架、差异树、证据 |
+| `POST /api/diagnose/comparisons/:key/cancel` | operator/admin | 仅 queued；竞态与已开始任务 409 |
+| `GET /api/diagnose/comparisons/:key/proof` | 全部三档 | 交付前强制验真的密封证明 |
+| `POST /api/diagnose/proofs/verify` | 全部三档 | 验证可能被外部改过的证明 |
+| `GET /api/diagnose/versions` | 全部三档 | 当前/可用版本与钉版语义 |
+| `POST /api/diagnose/versions/activate` | operator/admin | 仅影响之后新任务 |
+| `POST /api/diagnose/pump` | operator/admin | 确定性推进一轮异步计算 |
+
+```bash
+npm run verify:diagnose   # 100 项：合法比较/同键复用/同键异输入冲突/坏包拒绝(含六类破损)/
+                          #   并发唯一任务/水位边界/算法切换(在途留旧版)/崩溃恢复(阶段续办,
+                          #   解释节点只写一次)/取消竞态/证明篡改分层验真/三档角色越权/
+                          #   错误页面不回显输入包内容
 ```
 
 

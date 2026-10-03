@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-export const ROLES = ['operator', 'reviewer', 'inspector', 'admin'];
+export const ROLES = ['operator', 'reviewer', 'inspector', 'admin', 'analyst', 'observer'];
 
 /**
  * Static role tokens. Override via environment for deployment; defaults exist so
@@ -14,6 +14,7 @@ export function loadConfig(env = process.env) {
     dataDir,
     walPath: path.join(dataDir, 'converge.wal'),
     outboxPath: path.join(dataDir, 'outbox.wal'),
+    diagnoseWalPath: path.join(dataDir, 'diagnose.wal'),
     receiptSecret: env.CONVERGE_RECEIPT_SECRET || 'dev-receipt-secret-change-me',
     // Quiet period before an object settles: coalesces concurrent reports into
     // one decision. Determinism of the result does not depend on this value.
@@ -42,12 +43,26 @@ export function loadConfig(env = process.env) {
     // An in-flight batch older than this is reclaimable (worker died / ack lost).
     deliveryLeaseMs: Math.max(50, Number(env.CONVERGE_DELIVERY_LEASE_MS || 60000)),
 
+    // ------------------------------------------------------ causal diagnose --
+    // Background worker tick for asynchronous comparison tasks. Set to 0
+    // (tests) to disable the timer; processing is driven via POST /api/diagnose/pump.
+    diagnosePumpMs: Math.max(0, Number(env.CONVERGE_DIAGNOSE_PUMP_MS || 250)),
+    // Injected crash points for interrupted-computation recovery tests:
+    //   'before_start'   exits after a queued task is claimed, before its
+    //                    first durable phase -> task restarts as not-started
+    //   'after_diff'      process exits after the diffed phase commit
+    //   'after_evidence'  exits after evidence + phase commit (must never
+    //                     duplicate explanation nodes on restart)
+    diagnoseCrashPoint: env.CONVERGE_DIAGNOSE_CRASH_POINT || null,
+
     tokens: {
       [env.OPERATOR_TOKEN || 'operator-token']: 'operator',
       [env.REVIEWER1_TOKEN || 'reviewer1-token']: 'reviewer',
       [env.REVIEWER2_TOKEN || 'reviewer2-token']: 'reviewer',
       [env.INSPECTOR_TOKEN || 'inspector-token']: 'inspector',
       [env.ADMIN_TOKEN || 'admin-token']: 'admin',
+      [env.ANALYST_TOKEN || 'analyst-token']: 'analyst',
+      [env.OBSERVER_TOKEN || 'observer-token']: 'observer',
     },
     reviewerIdentities: {
       [env.REVIEWER1_TOKEN || 'reviewer1-token']: env.REVIEWER1_NAME || 'reviewer-01',

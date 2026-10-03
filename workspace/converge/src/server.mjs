@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { constantTimeEqual } from './crypto-util.mjs';
 import { loadConfig } from './config.mjs';
 import { ConvergenceStore, ApiError } from './store.mjs';
+import { DiagnoseManager, DiagnoseError, verifyProof } from './diagnose.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -124,20 +125,22 @@ function routeAllowed(role, method, pathname) {
 export function createServer(config = loadConfig()) {
   const store = new ConvergenceStore(config);
   store.open();
+  const diagnose = new DiagnoseManager(config);
+  diagnose.open();
 
   const server = http.createServer(async (req, res) => {
     try {
-      await handle(req, res, config, store);
+      await handle(req, res, config, store, diagnose);
     } catch (err) {
       sendError(res, err);
     }
   });
 
-  server.on('close', () => store.close());
-  return { server, store };
+  server.on('close', () => { diagnose.close(); store.close(); });
+  return { server, store, diagnose };
 }
 
-async function handle(req, res, config, store) {
+async function handle(req, res, config, store, diagnose) {
   const url = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
 
@@ -146,7 +149,13 @@ async function handle(req, res, config, store) {
     return serveFile(res, path.join(PUBLIC_DIR, 'index.html'), 'text/html; charset=utf-8');
   }
   if (pathname === '/app.js') return serveFile(res, path.join(PUBLIC_DIR, 'app.js'), 'application/javascript; charset=utf-8');
-  if (pathname.startsWith('/api/')) return handleApi(req, res, url, config, store);
+  if (pathname === '/diagnose' || pathname === '/diagnose.html') {
+    return serveFile(res, path.join(PUBLIC_DIR, 'diagnose.html'), 'text/html; charset=utf-8', true);
+  }
+  if (pathname === '/diagnose.js') {
+    return serveFile(res, path.join(PUBLIC_DIR, 'diagnose.js'), 'application/javascript; charset=utf-8', true);
+  }
+  if (pathname.startsWith('/api/')) return handleApi(req, res, url, config, store, diagnose);
   sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'not found' } });
 }
 
@@ -167,7 +176,7 @@ function authenticate(req, config) {
   return { role: matchedRole, reviewerId: reviewerName ? `anon-${matchedRole}-${reviewerName.slice(-2)}` : null, reviewerName };
 }
 
-async function handleApi(req, res, url, config, store) {
+async function handleApi(req, res, url, config, store, diagnose) {
   const auth = authenticate(req, config);
 
   // Role self-identification for the console: any authenticated token may ask
@@ -175,6 +184,17 @@ async function handleApi(req, res, url, config, store) {
   // UI cannot reliably infer the role from a single probe).
   if (url.pathname === '/api/whoami' && req.method === 'GET') {
     return sendJson(res, 200, { role: auth.role, reviewer_id: auth.reviewerId, reviewer_name: auth.reviewerName });
+  }
+
+  // ----------------------------------------------- causal divergence diagnose
+  // Dedicated three-tier visibility:
+  //   operator/admin  intake, algorithm versions, cancel, worker pump, reads
+  //   analyst         choose two groups, submit comparisons, read diff tree +
+  //                   desensitised evidence
+  //   observer        verify/inspect sealed proofs only (never chooses inputs,
+  //                   sees no watermark table or skeleton beyond a proof)
+  if (url.pathname.startsWith('/api/diagnose')) {
+    return handleDiagnoseApi(req, res, url, config, auth, diagnose);
   }
 
   if (!routeAllowed(auth.role, req.method, url.pathname)) {
@@ -317,6 +337,86 @@ async function handleApi(req, res, url, config, store) {
   throw new ApiError(404, 'NOT_FOUND', 'no such route');
 }
 
+/**
+ * Causal-divergence diagnose API. Visibility tiers are enforced here, separate
+ * from the convergence POLICY table:
+ *   operator/admin — intake, version management, cancel, pump, all reads
+ *   analyst        — group list, submit comparisons, read diff + evidence
+ *   observer       — sealed proofs and verification only
+ *
+ * Error responses carry stable reason codes but never echo submitted content.
+ */
+async function handleDiagnoseApi(req, res, url, config, auth, diagnose) {
+  const p = url.pathname;
+  const role = auth.role;
+  const isOps = role === 'operator' || role === 'admin';
+  const isAnalyst = role === 'analyst';
+  const isObserver = role === 'observer';
+
+  const deny = () => {
+    throw new ApiError(403, 'ROLE_NOT_PERMITTED', `${role} may not ${req.method} ${p}`);
+  };
+
+  // GET (and POST verify) routes are read first; POST bodies parsed only when
+  // the role may actually use the route.
+  if (req.method === 'GET' && p === '/api/diagnose/versions') {
+    if (!isOps && !isAnalyst && !isObserver) deny();
+    return sendJson(res, 200, await diagnose.versions());
+  }
+  if (req.method === 'GET' && p === '/api/diagnose/groups') {
+    if (!isOps && !isAnalyst) deny();
+    return sendJson(res, 200, { groups: await diagnose.listGroups() });
+  }
+  if (req.method === 'GET' && p === '/api/diagnose/comparisons') {
+    if (!isOps && !isAnalyst) deny();
+    return sendJson(res, 200, { comparisons: await diagnose.listComparisons() });
+  }
+  let m;
+  if ((m = /^\/api\/diagnose\/comparisons\/([^/]+)$/.exec(p)) && req.method === 'GET') {
+    if (!isOps && !isAnalyst) deny();
+    return sendJson(res, 200, await diagnose.getComparison(decodeURIComponent(m[1])));
+  }
+  if ((m = /^\/api\/diagnose\/comparisons\/([^/]+)\/proof$/.exec(p)) && req.method === 'GET') {
+    // The observer's one door: sealed desensitised proofs only.
+    if (!isOps && !isAnalyst && !isObserver) deny();
+    return sendJson(res, 200, await diagnose.getProof(decodeURIComponent(m[1])));
+  }
+
+  const body = req.method === 'POST' ? await readJson(req) : null;
+
+  if (p === '/api/diagnose/receipts' && req.method === 'POST') {
+    if (!isOps) deny();
+    return sendJson(res, 200, await diagnose.appendReceipts(body));
+  }
+  if (p === '/api/diagnose/comparisons' && req.method === 'POST') {
+    if (!isAnalyst) deny();
+    const result = await diagnose.submitComparison(body);
+    return sendJson(res, result.status, result.task);
+  }
+  if (p === '/api/diagnose/pump' && req.method === 'POST') {
+    if (!isOps) deny();
+    return sendJson(res, 200, await diagnose.pumpCycle());
+  }
+  if (p === '/api/diagnose/versions/activate' && req.method === 'POST') {
+    if (!isOps) deny();
+    return sendJson(res, 200, await diagnose.activateAlgorithm(body?.algorithm));
+  }
+  if (p === '/api/diagnose/proofs/verify' && req.method === 'POST') {
+    // Read-only observers verify proofs; every authenticated tier may verify.
+    if (!isOps && !isAnalyst && !isObserver) deny();
+    // Recompute from the externally supplied proof; nothing is stored or echoed
+    // beyond the layered verification verdict.
+    const verdict = verifyProof(body?.proof ?? body, config.receiptSecret);
+    return sendJson(res, 200, verdict);
+  }
+  if ((m = /^\/api\/diagnose\/comparisons\/([^/]+)\/cancel$/.exec(p)) && req.method === 'POST') {
+    if (!isOps) deny();
+    return sendJson(res, 200, await diagnose.cancelComparison(decodeURIComponent(m[1])));
+  }
+
+  throw new ApiError(404, 'NOT_FOUND', 'no such route');
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -342,17 +442,25 @@ function readJson(req) {
   });
 }
 
-function serveFile(res, filePath, contentType) {
+function serveFile(res, filePath, contentType, noStore = false) {
   fs.readFile(filePath, (err, data) => {
     if (err) return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'not found' } });
-    res.writeHead(200, { 'content-type': contentType });
+    res.writeHead(200, {
+      'content-type': contentType,
+      ...(noStore ? { 'cache-control': 'no-store' } : {}),
+    });
     res.end(data);
   });
 }
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  // Diagnose responses are role-filtered operational state: never cache them,
+  // so a refresh always re-reads task phase, watermarks and proof digests.
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
   res.end(body);
 }
 
